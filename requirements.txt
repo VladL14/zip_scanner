@@ -10,6 +10,8 @@ python-dotenv==1.0.1
 # CDR / MIME Dependencies
 pikepdf==8.15.1
 httpx==0.27.0
+vt-py==0.19.0
+yara-python==4.5.1
 
 # python-magic requires OS-specific dependencies
 # For Linux/Mac (Requires libmagic to be installed on the system)
