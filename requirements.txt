@@ -5,6 +5,7 @@ aiofiles==23.2.1
 fastapi==0.111.0
 uvicorn==0.29.0
 python-multipart==0.0.9
+python-dotenv==1.0.1
 
 # CDR / MIME Dependencies
 pikepdf==8.15.1
