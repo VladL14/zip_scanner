@@ -1,20 +1,16 @@
 import asyncio
 import hashlib
 import logging
+import os
 from pathlib import Path
 
 import aiofiles
+import httpx
 
 logger = logging.getLogger("StaticScanner")
 
-class StaticScanner:
-    # Dummy blacklist containing standard test hashes
-    # EICAR test string hash: 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
-    BLACKLISTED_HASHES = {
-        "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f",
-        "131f95c51cc819465fa1797f6cc0e2984a9c687e87ff27d21b7952e463a5aaec", # Hash of just the word "eicar"
-    }
 
+class StaticScanner:
     @classmethod
     async def _compute_sha256(cls, file_path: Path, chunk_size: int = 65536) -> str:
         """
@@ -28,16 +24,51 @@ class StaticScanner:
         return sha256_hash.hexdigest()
 
     @classmethod
-    async def _mock_vt_lookup(cls, file_hash: str) -> bool:
+    async def _vt_lookup(cls, file_hash: str) -> bool:
         """
-        Mock an API call to a threat intelligence feed (e.g. VirusTotal).
-        Returns True if the hash is clean/unknown, False if it is a known threat.
+        Query VirusTotal API v3 for file reputation.
+        Returns False if known threat (malicious votes > 0), True otherwise.
         """
-        # Simulate network latency for API call
-        await asyncio.sleep(0.1)
-        if file_hash in cls.BLACKLISTED_HASHES:
-            return False
-        return True
+        vt_api_key = os.getenv("VT_API_KEY")
+        if not vt_api_key:
+            logger.warning("VT_API_KEY environment variable is not set. Skipping real VirusTotal check (fail-open).")
+            return True
+
+        url = f"https://www.virustotal.com/api/v3/files/{file_hash}"
+        headers = {
+            "x-apikey": vt_api_key
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, headers=headers, timeout=10.0)
+
+            if response.status_code == 404:
+                # File not found in VT database, so it's unknown/clean
+                return True
+            elif response.status_code == 429:
+                logger.warning("VirusTotal API rate limit exceeded (429). Bypassing static check.")
+                return True
+            elif response.status_code != 200:
+                logger.error(f"VirusTotal API returned unexpected status {response.status_code}: {response.text}")
+                return True  # Fail open on unexpected errors
+
+            data = response.json()
+            stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+            malicious_votes = stats.get("malicious", 0)
+
+            if malicious_votes > 0:
+                logger.warning(f"VirusTotal flagged hash {file_hash} with {malicious_votes} malicious votes.")
+                return False
+
+            return True
+
+        except httpx.RequestError as e:
+            logger.error(f"Network error while contacting VirusTotal: {e}")
+            return True
+        except Exception as e:
+            logger.error(f"Unexpected error during VirusTotal lookup: {e}")
+            return True
 
     @classmethod
     async def check_file_reputation(cls, file_path: Path) -> bool:
@@ -50,7 +81,7 @@ class StaticScanner:
             file_hash = await cls._compute_sha256(file_path)
             
             # 2. Check Reputation (Threat Intel)
-            is_clean = await cls._mock_vt_lookup(file_hash)
+            is_clean = await cls._vt_lookup(file_hash)
             if not is_clean:
                 logger.warning(f"[StaticScan] KNOWN THREAT detected for {file_path.name} (Hash: {file_hash}). Dropping instantly.")
                 return False
