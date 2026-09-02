@@ -61,8 +61,10 @@ async def sanitize_file(background_tasks: BackgroundTasks, file: UploadFile = Fi
     # Schedule cleanup to run strictly AFTER the HTTP response is completed
     background_tasks.add_task(cleanup_temp_dir, temp_dir)
     
-    # Input and Output paths
-    input_path = temp_dir_path / "input.zip"
+    # Keep the original file extension for the input path
+    file_suffix = Path(file.filename).suffix
+    input_path = temp_dir_path / f"input{file_suffix}"
+    
     # Ensure the output filename clearly indicates it's safe
     safe_filename = f"clean_{file.filename}"
     output_path = temp_dir_path / safe_filename
@@ -80,10 +82,17 @@ async def sanitize_file(background_tasks: BackgroundTasks, file: UploadFile = Fi
         
         if success and output_path.exists():
             logger.info(f"API returning sanitized file: {safe_filename}")
+            
+            # Dynamically determine the content type
+            import mimetypes
+            media_type, _ = mimetypes.guess_type(str(output_path))
+            if not media_type:
+                media_type = "application/octet-stream"
+                
             return FileResponse(
                 path=str(output_path),
                 filename=safe_filename,
-                media_type="application/zip"
+                media_type=media_type
             )
         else:
             logger.warning(f"Sanitization failed or file was fully dropped: {file.filename}")

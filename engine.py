@@ -100,8 +100,8 @@ class SanitizationEngine:
         elif mime_type.startswith("image/") or mime_type.startswith("text/") or mime_type.startswith("video/") or mime_type.startswith("audio/"):
             is_safe = await self._process_media_text(file_path)
         else:
-            logger.warning(f"Unknown or unhandled MIME type '{mime_type}' for '{file_path.name}'. Dropping by default.")
-            is_safe = False
+            logger.warning(f"[Unknown] Unhandled MIME type '{mime_type}' for '{file_path.name}'. Falling back to static scan...")
+            is_safe = await StaticScanner.check_file_reputation(file_path)
 
         return file_path if is_safe else None
 
@@ -247,27 +247,36 @@ class SanitizationEngine:
         output_path = Path(output_archive_path)
 
         if not input_path.exists():
-            logger.error(f"Input archive not found: {input_path}")
+            logger.error(f"Input file not found: {input_path}")
             return False
 
-        # Copy original archive to output path to begin in-place sanitization
+        # Copy original file to output path to begin in-place sanitization
         try:
             shutil.copy2(input_path, output_path)
         except Exception as e:
-            logger.error(f"Failed to copy input archive: {e}")
+            logger.error(f"Failed to copy input file: {e}")
             return False
 
         logger.info(f"Starting Clean-Room pipeline on {output_path.name}")
-        success = await self._process_archive_internal(output_path, depth=1)
         
-        if success:
-            logger.info(f"Sanitization complete! Clean archive available at: {output_path}")
+        # Determine the MIME type of the root file
+        try:
+            mime_type = magic.from_file(str(output_path), mime=True)
+        except Exception as e:
+            logger.error(f"Failed to determine MIME type for {output_path.name}: {e}")
+            mime_type = "application/octet-stream"
+
+        # Route the root file through the same logic as extracted files
+        result = await self._process_file(output_path, mime_type, output_path.parent, current_depth=1)
+        
+        if result is not None:
+            logger.info(f"Sanitization complete! Clean file available at: {output_path}")
+            return True
         else:
-            logger.error("Sanitization failed or archive was completely malicious/empty.")
+            logger.error("Sanitization failed or file was completely malicious/empty.")
             if output_path.exists():
                 output_path.unlink()  # Clean up failed output
-
-        return success
+            return False
 
 
 # --- Example Usage & Testing ---
