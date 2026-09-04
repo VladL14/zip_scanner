@@ -11,28 +11,30 @@ import yara
 logger = logging.getLogger("StaticScanner")
 
 class StaticScanner:
-    # Compile YARA rules at the class level so it's only done once during startup
-    YARA_RULES = yara.compile(source="""
-        rule Suspicious_PowerShell {
-            meta:
-                description = "Detects suspicious PowerShell execution policies"
-                author = "Clean-Room"
-            strings:
-                $ps1 = "powershell -ExecutionPolicy Bypass" nocase
-                $ps2 = "powershell.exe -ep bypass" nocase
-                $ps3 = "Invoke-Expression" nocase
-            condition:
-                any of them
-        }
-        rule EICAR_Test_String {
-            meta:
-                description = "Standard AV test string"
-            strings:
-                $eicar = "X5O!P%@AP[4\\\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
-            condition:
-                $eicar
-        }
-    """)
+    YARA_RULES = None
+    # TODO: Replace with Redis for distributed caching in production
+    _VT_CACHE = {}
+
+    @classmethod
+    def load_rules(cls, rules_dir: Path):
+        """
+        Dynamically load and compile all .yar/.yara rules from the specified directory.
+        """
+        filepaths = {}
+        if rules_dir.exists() and rules_dir.is_dir():
+            for rule_file in rules_dir.glob("*.yar*"):
+                # yara.compile expects a dict of {namespace: filepath}
+                filepaths[rule_file.stem] = str(rule_file)
+                
+        try:
+            if filepaths:
+                cls.YARA_RULES = yara.compile(filepaths=filepaths)
+                logger.info(f"Successfully loaded {len(filepaths)} YARA rule files from {rules_dir}")
+            else:
+                raise ValueError("No YARA rules found in directory.")
+        except Exception as e:
+            logger.warning(f"Failed to load dynamic YARA rules from {rules_dir}: {e}. Falling back to dummy rule.")
+            cls.YARA_RULES = yara.compile(source='rule Dummy_Rule { condition: false }')
 
     @classmethod
     async def _compute_sha256(cls, file_path: Path, chunk_size: int = 65536) -> str:
@@ -52,6 +54,10 @@ class StaticScanner:
         Query VirusTotal API v3 using vt-py for file reputation.
         Returns False if known threat (malicious votes >= 2), True otherwise.
         """
+        if file_hash in cls._VT_CACHE:
+            logger.debug(f"VirusTotal Cache HIT for {file_hash}")
+            return cls._VT_CACHE[file_hash]
+
         vt_api_key = os.getenv("VT_API_KEY")
         if not vt_api_key:
             logger.warning("VT_API_KEY environment variable is not set. Skipping VirusTotal check.")
@@ -65,13 +71,16 @@ class StaticScanner:
                 malicious_votes = file_obj.last_analysis_stats.get('malicious', 0)
                 if malicious_votes >= 2:
                     logger.warning(f"VirusTotal flagged hash {file_hash} with {malicious_votes} malicious votes.")
+                    cls._VT_CACHE[file_hash] = False
                     return False
                 
+                cls._VT_CACHE[file_hash] = True
                 return True
                 
         except vt.error.APIError as e:
             if e.code == "NotFoundError":
                 # File not found in VT database, so it's unknown/clean to them
+                cls._VT_CACHE[file_hash] = True
                 return True
             logger.error(f"VirusTotal API Error: {e.message} (Code: {e.code}). Bypassing VT check.")
             return True
@@ -105,33 +114,28 @@ class StaticScanner:
         return await asyncio.to_thread(cls._scan_yara_sync, file_path)
 
     @classmethod
-    async def check_file_reputation(cls, file_path: Path) -> bool:
+    async def check_virustotal(cls, file_path: Path) -> bool:
         """
-        Dual-layer static scan: VirusTotal (external) + YARA (local).
-        Returns False if the file is a known threat, True if unknown/clean.
+        Public wrapper to compute hash and check VirusTotal.
         """
         try:
-            # 1. Compute Hash
             file_hash = await cls._compute_sha256(file_path)
-            
-            # 2. Layer 1: VirusTotal Threat Intel
             logger.debug(f"Checking VirusTotal for {file_path.name} (Hash: {file_hash})...")
-            is_vt_clean = await cls._check_virustotal(file_hash)
-            if not is_vt_clean:
-                logger.warning(f"[StaticScan] External Threat (VT) detected for {file_path.name}. Dropping instantly.")
-                return False
-                
-            # 3. Layer 2: Local YARA Pattern Matching
-            logger.debug(f"Running YARA scan on {file_path.name}...")
-            is_yara_clean = await cls._scan_yara(file_path)
-            if not is_yara_clean:
-                logger.warning(f"[StaticScan] Local Threat (YARA) detected for {file_path.name}. Dropping instantly.")
-                return False
-                
-            logger.info(f"[StaticScan] File passed all static reputation checks: {file_path.name}.")
-            return True
-            
+            is_clean = await cls._check_virustotal(file_hash)
+            if not is_clean:
+                logger.warning(f"[StaticScan] External Threat (VT) detected for {file_path.name}. Dropping.")
+            return is_clean
         except Exception as e:
-            logger.error(f"Error during static scanning pipeline for {file_path.name}: {e}")
-            # If we fail to read or hash, dropping is the safest enterprise default
+            logger.error(f"Error during VT check for {file_path.name}: {e}")
             return False
+
+    @classmethod
+    async def scan_yara(cls, file_path: Path) -> bool:
+        """
+        Public wrapper to run YARA scan asynchronously.
+        """
+        logger.debug(f"Running YARA scan on {file_path.name}...")
+        is_clean = await cls._scan_yara(file_path)
+        if not is_clean:
+            logger.warning(f"[StaticScan] Local Threat (YARA) detected for {file_path.name}. Dropping.")
+        return is_clean

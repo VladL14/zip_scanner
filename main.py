@@ -13,6 +13,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from engine import SanitizationEngine
+from static_scanner import StaticScanner
+
+# Load YARA rules dynamically at application startup
+yara_dir = Path(__file__).parent / "yara_rules"
+StaticScanner.load_rules(yara_dir)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger("FastAPI")

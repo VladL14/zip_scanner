@@ -2,246 +2,236 @@ import asyncio
 import logging
 import os
 import shutil
+import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
 from typing import List, Optional
 
-import aiofiles
 import magic
 
 from cdr_office import OfficeSanitizer
 from cdr_pdf import PDFSanitizer
+from dlp_scanner import DLPScanner
 from static_scanner import StaticScanner
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger("SanitizationEngine")
 
 
+class MLScanner:
+    """Placeholder for future Machine Learning / AI Sandbox integrations."""
+    @staticmethod
+    async def analyze_bytes(file_path: Path) -> bool:
+        """Mock AI analysis for executables."""
+        logger.info(f"[MLScanner] Analyzing {file_path.name} (Mocking as Safe)")
+        await asyncio.sleep(0.5)
+        return True
+
+
 class SecurityViolation(Exception):
-    """Exception raised for security violations like Zip-Slip or Zip-Bomb."""
+    """Exception raised for security violations like Zip-Bomb."""
     pass
 
 
 class SanitizationEngine:
     def __init__(
         self,
-        max_file_size: int = 500 * 1024 * 1024,        # 500 MB per file - allows for large enterprise documents (CAD, raw video)
-        max_total_size: int = 2 * 1024 * 1024 * 1024,  # 2 GB total per archive - enterprise standard for web uploads
-        max_compression_ratio: float = 250.0,          # Max compression ratio - some text logs compress very well
-        max_depth: int = 3                             # Max recursive archive depth to prevent infinite loops
+        max_file_size: int = 500 * 1024 * 1024,        # 500 MB per file
+        max_total_size: int = 2 * 1024 * 1024 * 1024,  # 2 GB total per archive
+        max_files: int = 10000,                        # Max files per archive
     ):
-        """
-        Enterprise-grade configurations for extraction limits.
-        """
         self.max_file_size = max_file_size
         self.max_total_size = max_total_size
-        self.max_compression_ratio = max_compression_ratio
-        self.max_depth = max_depth
+        self.max_files = max_files
 
-    async def _process_executable(self, file_path: Path) -> bool:
-        """Route A: Executables (PE, ELF, Scripts)"""
-        logger.info(f"[Exec/Sandbox] Fast-tracking {file_path.name} through static reputation...")
-        is_clean = await StaticScanner.check_file_reputation(file_path)
-        if not is_clean:
-            return False
-            
-        logger.info(f"[Exec/Sandbox] Sending {file_path.name} to Sandbox/ML model...")
-        await asyncio.sleep(0.5)  # Mock async call
-        logger.info(f"[Exec/Sandbox] {file_path.name} was analyzed. (Mocking as Safe)")
-        return True
-
-    async def _process_document(self, file_path: Path, mime_type: str) -> bool:
-        """Route B: Documents (PDF, Office)"""
-        logger.info(f"[Doc/CDR] Performing CDR on {file_path.name}...")
-        
-        if "pdf" in mime_type:
-            success = await PDFSanitizer.sanitize_pdf(file_path)
-        elif "officedocument" in mime_type or "msword" in mime_type:
-            success = await OfficeSanitizer.sanitize_ooxml(file_path)
-        else:
-            logger.warning(f"[Doc/CDR] Unknown document format: {mime_type}. Mocking as safe.")
-            success = True
-            
-        if success:
-            logger.info(f"[Doc/CDR] {file_path.name} sanitized successfully.")
-            return True
-        else:
-            logger.error(f"[Doc/CDR] {file_path.name} could not be sanitized and will be dropped.")
-            return False
-
-    async def _process_media_text(self, file_path: Path) -> bool:
-        """Route C: Media/Text (Images, Plain text)"""
-        logger.info(f"[Media/Static] Running static reputation check on {file_path.name}...")
-        is_clean = await StaticScanner.check_file_reputation(file_path)
-        if not is_clean:
-            return False
-            
-        logger.info(f"[Media/Static] {file_path.name} passed static scan.")
-        return True
-
-    async def _process_file(self, file_path: Path, mime_type: str, extract_dir: Path, current_depth: int) -> Optional[Path]:
+    async def _process_atomic_file(self, input_path: Path, mime_type: str, staging_dir: Path) -> Optional[Path]:
         """
-        Routes the file to the appropriate pipeline based on its MIME type.
-        Returns the path to the safe/sanitized file, or None if it should be dropped.
+        Universal Multi-Layered Triage.
+        Routes files based on their type to either the Detection Pipeline or CDR Pipeline.
         """
-        logger.info(f"Routing '{file_path.name}' with MIME type: {mime_type}")
+        file_path = input_path
         is_safe = False
+        
+        # Route A: Detection Pipeline (Executables/Scripts)
+        if mime_type.startswith("application/x-dosexec") or mime_type.startswith("application/x-executable") or mime_type.startswith("text/x-"):
+            logger.info(f"[{file_path.name}] Route A: Detection Pipeline (Executables)")
+            
+            is_vt_clean = await StaticScanner.check_virustotal(file_path)
+            if is_vt_clean:
+                is_yara_clean = await StaticScanner.scan_yara(file_path)
+                if is_yara_clean:
+                    is_ml_clean = await MLScanner.analyze_bytes(file_path)
+                    if is_ml_clean:
+                        is_safe = True
 
-        if "zip" in mime_type or "rar" in mime_type or "7z" in mime_type or "tar" in mime_type:
-            logger.info(f"[Archive] Recursive archive detected: {file_path.name}")
-            # Route D: Archives
-            is_safe = await self._process_archive_internal(file_path, current_depth + 1)
-            # If safe, the recursive function has already replaced the file in-place with a clean version.
-        elif mime_type.startswith("application/x-dosexec") or mime_type.startswith("application/x-executable") or mime_type.startswith("text/x-"):
-            is_safe = await self._process_executable(file_path)
-        elif "pdf" in mime_type or "msword" in mime_type or "officedocument" in mime_type:
-            is_safe = await self._process_document(file_path, mime_type)
-        elif mime_type.startswith("image/") or mime_type.startswith("text/") or mime_type.startswith("video/") or mime_type.startswith("audio/"):
-            is_safe = await self._process_media_text(file_path)
+        # Route B: CDR Pipeline (Documents - Zero Trust)
+        elif "pdf" in mime_type:
+            logger.info(f"[{file_path.name}] Route B: CDR Pipeline (PDF)")
+            is_safe = await PDFSanitizer.sanitize_pdf(file_path)
+            if is_safe:
+                is_safe = await DLPScanner.scan_for_sensitive_data(file_path)
+            
+        elif "officedocument" in mime_type or "msword" in mime_type:
+            logger.info(f"[{file_path.name}] Route B: CDR Pipeline (Office)")
+            is_safe = await OfficeSanitizer.sanitize_ooxml(file_path)
+            if is_safe:
+                is_safe = await DLPScanner.scan_for_sensitive_data(file_path)
+            
+        # Fallback (Media/Text/Unknown)
         else:
-            logger.warning(f"[Unknown] Unhandled MIME type '{mime_type}' for '{file_path.name}'. Falling back to static scan...")
-            is_safe = await StaticScanner.check_file_reputation(file_path)
+            logger.info(f"[{file_path.name}] Default Route: Static Scanning (Media/Text/Unknown)")
+            is_vt_clean = await StaticScanner.check_virustotal(file_path)
+            if is_vt_clean:
+                is_yara_clean = await StaticScanner.scan_yara(file_path)
+                if is_yara_clean:
+                    is_safe = await DLPScanner.scan_for_sensitive_data(file_path)
 
+        if not is_safe:
+            logger.warning(f"File {file_path.name} failed triage and was DROPPED.")
+            
         return file_path if is_safe else None
 
-    def _extract_safely(self, archive_path: Path, extract_dir: Path) -> List[Path]:
+    def _safe_unpack(self, archive_path: Path, extract_dir: Path) -> List[Path]:
         """
-        Extracts an archive synchronously while strictly enforcing Anti-Zip-Bomb and Anti-Zip-Slip rules.
+        Safely unpack ZIP and TAR archives while enforcing limits BEFORE extraction.
+        Prevents Zip-Bomb and Zip-Slip attacks.
         """
         extracted_files = []
         total_extracted_size = 0
-        archive_size = archive_path.stat().st_size
+        file_count = 0
+        
+        resolved_extract_dir = extract_dir.resolve()
 
-        if not zipfile.is_zipfile(archive_path):
-            logger.error(f"File {archive_path.name} is not a valid ZIP archive.")
-            return extracted_files
+        if zipfile.is_zipfile(archive_path):
+            with zipfile.ZipFile(archive_path, 'r') as zf:
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                        
+                    file_count += 1
+                    if file_count > self.max_files:
+                        raise SecurityViolation(f"Archive exceeds max file count limit ({self.max_files})")
+                        
+                    if info.file_size > self.max_file_size:
+                        raise SecurityViolation(f"File {info.filename} exceeds max file size limit.")
+                        
+                    total_extracted_size += info.file_size
+                    if total_extracted_size > self.max_total_size:
+                        raise SecurityViolation("Archive exceeds max total extraction size.")
 
-        with zipfile.ZipFile(archive_path, 'r') as zf:
-            for info in zf.infolist():
-                if info.is_dir():
-                    continue
+                    # Zip-Slip Prevention
+                    target_path = (extract_dir / info.filename).resolve()
+                    if not str(target_path).startswith(str(resolved_extract_dir)):
+                        logger.warning(f"Zip-Slip attempt detected and blocked! File: {info.filename}")
+                        continue
 
-                # 1. Zip-Bomb Prevention
-                if info.file_size > self.max_file_size:
-                    raise SecurityViolation(f"File {info.filename} exceeds max file size limit ({self.max_file_size} bytes)")
-                
-                total_extracted_size += info.file_size
-                if total_extracted_size > self.max_total_size:
-                    raise SecurityViolation(f"Archive exceeds max total extraction size ({self.max_total_size} bytes)")
-                
-                if archive_size > 0:
-                    ratio = info.file_size / archive_size
-                    if ratio > self.max_compression_ratio:
-                        raise SecurityViolation(f"File {info.filename} exceeds max compression ratio ({self.max_compression_ratio})")
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info.filename) as source, open(target_path, "wb") as target:
+                        shutil.copyfileobj(source, target)
+                        
+                    extracted_files.append(target_path)
+                    
+        elif tarfile.is_tarfile(archive_path):
+            with tarfile.open(archive_path, 'r:*') as tf:
+                for member in tf.getmembers():
+                    if member.isdir():
+                        continue
+                        
+                    file_count += 1
+                    if file_count > self.max_files:
+                        raise SecurityViolation(f"Archive exceeds max file count limit ({self.max_files})")
+                        
+                    if member.size > self.max_file_size:
+                        raise SecurityViolation(f"File {member.name} exceeds max file size limit.")
+                        
+                    total_extracted_size += member.size
+                    if total_extracted_size > self.max_total_size:
+                        raise SecurityViolation("Archive exceeds max total extraction size.")
 
-                # 2. Zip-Slip Prevention
-                # Resolve the absolute path of the target and the extraction directory
-                target_path = extract_dir / info.filename
-                resolved_target = target_path.resolve()
-                resolved_extract_dir = extract_dir.resolve()
+                    # Tar-Slip Prevention
+                    target_path = (extract_dir / member.name).resolve()
+                    if not str(target_path).startswith(str(resolved_extract_dir)):
+                        logger.warning(f"Tar-Slip attempt detected and blocked! File: {member.name}")
+                        continue
 
-                # Ensure the resolved target path is strictly within the extraction directory
-                if not str(resolved_target).startswith(str(resolved_extract_dir)):
-                    logger.warning(f"Zip-Slip attempt detected and blocked! File: {info.filename}")
-                    continue  # Skip malicious file instead of failing entire archive (Enterprise approach)
-
-                # Proceed with safe extraction manually to guarantee path integrity
-                resolved_target.parent.mkdir(parents=True, exist_ok=True)
-                
-                with zf.open(info.filename) as source, open(resolved_target, "wb") as target:
-                    shutil.copyfileobj(source, target)
-                
-                extracted_files.append(resolved_target)
-                logger.debug(f"Safely extracted: {resolved_target}")
-                
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    if member.isreg():
+                        f = tf.extractfile(member)
+                        if f is not None:
+                            with open(target_path, "wb") as target:
+                                shutil.copyfileobj(f, target)
+                            extracted_files.append(target_path)
+                    else:
+                        logger.warning(f"Skipping non-regular tar member: {member.name}")
+        else:
+            raise SecurityViolation("Unsupported archive format or corrupted file.")
+            
         return extracted_files
 
-    async def _process_archive_internal(self, archive_path: Path, depth: int) -> bool:
+    async def _unpack_and_process_archive(self, input_path: Path, staging_dir: Path) -> bool:
         """
-        Processes an archive recursively. Replaces the archive_path with a sanitized version.
+        Unpacks archive, processes contents concurrently, and repacks into a clean ZIP.
         """
-        if depth > self.max_depth:
-            logger.warning(f"Max recursion depth reached ({self.max_depth}). Dropping archive: {archive_path.name}")
-            return False
-
-        logger.info(f"Processing archive at depth {depth}: {archive_path.name}")
+        extract_dir = staging_dir / "extracted"
+        extract_dir.mkdir(parents=True, exist_ok=True)
         
-        # Create a unique temp directory for this extraction bounded by standard OS temp mechanisms
-        with tempfile.TemporaryDirectory(prefix="safe_extract_") as temp_dir:
-            temp_path = Path(temp_dir)
+        try:
+            extracted_files = await asyncio.to_thread(self._safe_unpack, input_path, extract_dir)
+        except SecurityViolation as e:
+            logger.error(f"Security violation extracting {input_path.name}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Error unpacking {input_path.name}: {e}")
+            return False
             
+        # Triage and Route all extracted files concurrently
+        tasks = []
+        for file_path in extracted_files:
             try:
-                # Extract synchronously (CPU/IO bound, moved to thread to avoid blocking event loop)
-                extracted_files = await asyncio.to_thread(self._extract_safely, archive_path, temp_path)
-            except SecurityViolation as e:
-                logger.error(f"Security violation while extracting {archive_path.name}: {e}")
-                return False
-            except Exception as e:
-                logger.error(f"Error extracting {archive_path.name}: {e}")
-                return False
-
-            if not extracted_files:
-                logger.warning(f"No files safely extracted from {archive_path.name} (maybe all were malicious/empty).")
-                return False
-
-            # Triage and Route
-            tasks = []
-            for file_path in extracted_files:
-                # Determine REAL MIME type via magic bytes
-                try:
-                    mime_type = magic.from_file(str(file_path), mime=True)
-                except Exception as e:
-                    logger.error(f"Failed to determine MIME type for {file_path.name}: {e}")
-                    mime_type = "application/octet-stream"
+                mime_type = magic.from_file(str(file_path), mime=True)
+            except Exception:
+                mime_type = "application/octet-stream"
                 
-                tasks.append(self._process_file(file_path, mime_type, temp_path, depth))
-
-            # Wait for all files in this archive to be processed concurrently
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            safe_files = []
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.error(f"Pipeline error during file processing: {result}")
-                elif result is not None:
-                    safe_files.append(result)
-
-            if not safe_files:
-                logger.warning(f"All files in {archive_path.name} were dropped during triage. Dropping the archive.")
-                return False
-
-            # Reconstruct the archive
-            logger.info(f"Reconstructing safe archive for: {archive_path.name}")
-            try:
-                await asyncio.to_thread(self._repack_archive, archive_path, safe_files, temp_path)
-                return True
-            except Exception as e:
-                logger.error(f"Failed to repack archive {archive_path.name}: {e}")
-                return False
+            tasks.append(self._process_atomic_file(file_path, mime_type, extract_dir))
+            
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        safe_files = []
+        for res in results:
+            if isinstance(res, Exception):
+                logger.error(f"Pipeline error during concurrent processing: {res}")
+            elif res is not None:
+                safe_files.append(res)
+                
+        if not safe_files:
+            logger.warning(f"All files inside {input_path.name} were dropped. Archive is fully malicious or empty.")
+            return False
+            
+        # The Compiler: Repack into a clean ZIP archive (standard enterprise output)
+        repack_path = staging_dir / f"clean_{input_path.stem}.zip"
+        await asyncio.to_thread(self._repack_archive, repack_path, safe_files, extract_dir)
+        
+        # Replace original with the sanitized archive
+        shutil.move(repack_path, input_path.with_suffix('.zip'))
+        
+        # Clean up the original if it wasn't a zip (e.g. tar.gz to zip conversion)
+        if input_path.suffix != '.zip' and input_path.exists():
+            input_path.unlink()
+            
+        return True
 
     def _repack_archive(self, output_archive: Path, safe_files: List[Path], base_dir: Path):
-        """
-        Creates a new ZIP archive containing only the safe files.
-        Maintains relative paths based on base_dir.
-        """
-        # Repack into a temporary file first to avoid corruption if interrupted
-        temp_output = output_archive.with_suffix(".tmp")
-        
-        with zipfile.ZipFile(temp_output, 'w', zipfile.ZIP_DEFLATED) as zf:
+        """Creates a new ZIP archive containing only the safe files, maintaining structure."""
+        with zipfile.ZipFile(output_archive, 'w', zipfile.ZIP_DEFLATED) as zf:
             for file_path in safe_files:
-                # Compute relative path to maintain folder structure
                 relative_path = file_path.relative_to(base_dir)
                 zf.write(file_path, arcname=str(relative_path))
-                logger.debug(f"Repacked {relative_path} into {output_archive.name}")
-                
-        # Replace original archive with the safe temporary one
-        temp_output.replace(output_archive)
+                logger.debug(f"Repacked safe file: {relative_path}")
 
     async def process(self, input_archive_path: str, output_archive_path: str) -> bool:
         """
-        Main entry point for the Sanitization Engine.
-        Copies the input to the output location first, then processes it in-place.
+        Universal entry point for the Sanitization Pipeline.
         """
         input_path = Path(input_archive_path)
         output_path = Path(output_archive_path)
@@ -250,74 +240,47 @@ class SanitizationEngine:
             logger.error(f"Input file not found: {input_path}")
             return False
 
-        # Copy original file to output path to begin in-place sanitization
         try:
-            shutil.copy2(input_path, output_path)
+            mime_type = magic.from_file(str(input_path), mime=True)
         except Exception as e:
-            logger.error(f"Failed to copy input file: {e}")
+            logger.error(f"Failed to determine MIME type for {input_path.name}: {e}")
             return False
 
-        logger.info(f"Starting Clean-Room pipeline on {output_path.name}")
-        
-        # Determine the MIME type of the root file
-        try:
-            mime_type = magic.from_file(str(output_path), mime=True)
-        except Exception as e:
-            logger.error(f"Failed to determine MIME type for {output_path.name}: {e}")
-            mime_type = "application/octet-stream"
+        # Create a secure temporary staging directory for this execution
+        with tempfile.TemporaryDirectory(prefix="sanitization_staging_") as staging_dir_str:
+            staging_dir = Path(staging_dir_str)
+            staging_input = staging_dir / input_path.name
+            
+            try:
+                shutil.copy2(input_path, staging_input)
+            except Exception as e:
+                logger.error(f"Failed to copy input to staging environment: {e}")
+                return False
 
-        # Route the root file through the same logic as extracted files
-        result = await self._process_file(output_path, mime_type, output_path.parent, current_depth=1)
-        
-        if result is not None:
-            logger.info(f"Sanitization complete! Clean file available at: {output_path}")
-            return True
-        else:
-            logger.error("Sanitization failed or file was completely malicious/empty.")
-            if output_path.exists():
-                output_path.unlink()  # Clean up failed output
-            return False
+            success = False
+            final_staging_file = staging_input
 
+            # Determine routing path
+            if any(ext in mime_type for ext in ["zip", "tar", "gzip", "bzip2", "x-rar", "7z"]):
+                logger.info(f"[{input_path.name}] Identified as ARCHIVE. Unpacking contents...")
+                success = await self._unpack_and_process_archive(staging_input, staging_dir)
+                final_staging_file = staging_input.with_suffix('.zip')
+            else:
+                logger.info(f"[{input_path.name}] Identified as ATOMIC FILE. Routing directly...")
+                result = await self._process_atomic_file(staging_input, mime_type, staging_dir)
+                if result is not None:
+                    success = True
+                    final_staging_file = result
 
-# --- Example Usage & Testing ---
-
-async def main():
-    test_dir = Path("test_data")
-    test_dir.mkdir(exist_ok=True)
-    
-    # 1. Create safe file
-    dummy_txt = test_dir / "safe.txt"
-    dummy_txt.write_text("Hello World! This is a clean text document.")
-    
-    # 2. Create mock malicious executable
-    dummy_exe = test_dir / "malicious.exe"
-    dummy_exe.write_bytes(b"MZ" + b"\x00" * 1024) 
-    
-    # 3. Create input ZIP with a Zip-Slip payload
-    input_zip = test_dir / "input.zip"
-    with zipfile.ZipFile(input_zip, 'w') as zf:
-        zf.write(dummy_txt, arcname="safe.txt")
-        zf.write(dummy_exe, arcname="malicious.exe")
-        
-        # Crafting a Zip-Slip payload
-        zinfo = zipfile.ZipInfo("../evil.txt")
-        zf.writestr(zinfo, "I am a path traversal payload!")
-
-    logger.info(f"Created test archive at {input_zip} containing safe.txt, malicious.exe, and ../evil.txt")
-
-    # 4. Run the Engine
-    engine = SanitizationEngine()
-    output_zip = test_dir / "clean_output.zip"
-    
-    await engine.process(str(input_zip), str(output_zip))
-    
-    # 5. Verify the output
-    if output_zip.exists():
-        logger.info("Contents of the final sanitized ZIP:")
-        with zipfile.ZipFile(output_zip, 'r') as zf:
-            for name in zf.namelist():
-                logger.info(f" - {name}")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            if success and final_staging_file.exists():
+                try:
+                    # Export the final clean file to the requested output path
+                    shutil.move(str(final_staging_file), str(output_path))
+                    logger.info(f"Sanitization complete! Safe output generated.")
+                    return True
+                except Exception as e:
+                    logger.error(f"Failed to export clean file: {e}")
+                    return False
+            else:
+                logger.error(f"Sanitization aborted. {input_path.name} was rejected.")
+                return False
