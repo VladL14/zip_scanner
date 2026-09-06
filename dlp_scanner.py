@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 
 import aiofiles
-import fitz  # PyMuPDF
+import pymupdf  # Replaced deprecated fitz
 
 logger = logging.getLogger("DLPScanner")
 
@@ -21,7 +21,7 @@ class DLPScanner:
     def _scan_pdf_sync(cls, file_path: Path) -> bool:
         """Extracts text from PDF and scans it."""
         try:
-            doc = fitz.open(file_path)
+            doc = pymupdf.open(file_path)
             for page in doc:
                 text = page.get_text()
                 if not text:

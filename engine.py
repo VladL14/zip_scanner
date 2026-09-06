@@ -10,6 +10,7 @@ from typing import List, Optional
 
 import magic
 
+from cdr_image import ImageSanitizer
 from cdr_office import OfficeSanitizer
 from cdr_pdf import PDFSanitizer
 from dlp_scanner import DLPScanner
@@ -39,21 +40,34 @@ class SanitizationEngine:
         max_file_size: int = 500 * 1024 * 1024,        # 500 MB per file
         max_total_size: int = 2 * 1024 * 1024 * 1024,  # 2 GB total per archive
         max_files: int = 10000,                        # Max files per archive
+        max_depth: int = 3,                            # Max recursion depth
     ):
         self.max_file_size = max_file_size
         self.max_total_size = max_total_size
         self.max_files = max_files
+        self.max_depth = max_depth
 
-    async def _process_atomic_file(self, input_path: Path, mime_type: str, staging_dir: Path) -> Optional[Path]:
+    async def _process_atomic_file(self, input_path: Path, mime_type: str, staging_dir: Path, current_depth: int) -> Optional[Path]:
         """
         Universal Multi-Layered Triage.
-        Routes files based on their type to either the Detection Pipeline or CDR Pipeline.
+        Routes files based on their type to either the Detection Pipeline, CDR Pipeline, or Nested Archives.
         """
         file_path = input_path
         is_safe = False
         
+        # Route D: Nested Archives
+        if any(ext in mime_type for ext in ["zip", "tar", "gzip", "bzip2", "x-rar", "7z"]):
+            if current_depth >= self.max_depth:
+                logger.warning(f"[{file_path.name}] Max recursion depth reached ({self.max_depth}). Dropping nested archive.")
+            else:
+                logger.info(f"[{file_path.name}] Route D: Nested Archive (Depth: {current_depth})")
+                is_safe = await self._unpack_and_process_archive(file_path, staging_dir, current_depth + 1)
+                if is_safe:
+                    # _unpack_and_process_archive repacks as .zip and deletes original if it was .tar
+                    file_path = file_path.with_suffix('.zip')
+        
         # Route A: Detection Pipeline (Executables/Scripts)
-        if mime_type.startswith("application/x-dosexec") or mime_type.startswith("application/x-executable") or mime_type.startswith("text/x-"):
+        elif mime_type.startswith("application/x-dosexec") or mime_type.startswith("application/x-executable") or mime_type.startswith("text/x-"):
             logger.info(f"[{file_path.name}] Route A: Detection Pipeline (Executables)")
             
             is_vt_clean = await StaticScanner.check_virustotal(file_path)
@@ -76,10 +90,17 @@ class SanitizationEngine:
             is_safe = await OfficeSanitizer.sanitize_ooxml(file_path)
             if is_safe:
                 is_safe = await DLPScanner.scan_for_sensitive_data(file_path)
+
+        # Route C: Media/Images
+        elif mime_type.startswith("image/"):
+            logger.info(f"[{file_path.name}] Route C: CDR Pipeline (Image)")
+            is_safe = await ImageSanitizer.sanitize_image(file_path)
+            if is_safe:
+                is_safe = await DLPScanner.scan_for_sensitive_data(file_path)
             
-        # Fallback (Media/Text/Unknown)
+        # Route E: Fallback (Text/Unknown)
         else:
-            logger.info(f"[{file_path.name}] Default Route: Static Scanning (Media/Text/Unknown)")
+            logger.info(f"[{file_path.name}] Route E: Fallback Static Scanning (Text/Unknown)")
             is_vt_clean = await StaticScanner.check_virustotal(file_path)
             if is_vt_clean:
                 is_yara_clean = await StaticScanner.scan_yara(file_path)
@@ -169,11 +190,11 @@ class SanitizationEngine:
             
         return extracted_files
 
-    async def _unpack_and_process_archive(self, input_path: Path, staging_dir: Path) -> bool:
+    async def _unpack_and_process_archive(self, input_path: Path, staging_dir: Path, current_depth: int) -> bool:
         """
         Unpacks archive, processes contents concurrently, and repacks into a clean ZIP.
         """
-        extract_dir = staging_dir / "extracted"
+        extract_dir = staging_dir / f"extracted_{input_path.stem}_{current_depth}"
         extract_dir.mkdir(parents=True, exist_ok=True)
         
         try:
@@ -193,7 +214,7 @@ class SanitizationEngine:
             except Exception:
                 mime_type = "application/octet-stream"
                 
-            tasks.append(self._process_atomic_file(file_path, mime_type, extract_dir))
+            tasks.append(self._process_atomic_file(file_path, mime_type, extract_dir, current_depth))
             
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
@@ -263,11 +284,11 @@ class SanitizationEngine:
             # Determine routing path
             if any(ext in mime_type for ext in ["zip", "tar", "gzip", "bzip2", "x-rar", "7z"]):
                 logger.info(f"[{input_path.name}] Identified as ARCHIVE. Unpacking contents...")
-                success = await self._unpack_and_process_archive(staging_input, staging_dir)
+                success = await self._unpack_and_process_archive(staging_input, staging_dir, current_depth=1)
                 final_staging_file = staging_input.with_suffix('.zip')
             else:
                 logger.info(f"[{input_path.name}] Identified as ATOMIC FILE. Routing directly...")
-                result = await self._process_atomic_file(staging_input, mime_type, staging_dir)
+                result = await self._process_atomic_file(staging_input, mime_type, staging_dir, current_depth=1)
                 if result is not None:
                     success = True
                     final_staging_file = result
